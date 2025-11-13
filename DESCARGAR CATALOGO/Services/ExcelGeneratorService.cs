@@ -1,14 +1,18 @@
-﻿using System;
-using System.Collections.Generic;
+using System;
 using System.IO;
 using System.Linq;
+using System.Drawing;
 using System.Threading.Tasks;
-using DESCARGAR_CATALOGO.Models;
+using System.Collections.Generic;
+
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
+
 using OfficeOpenXml;
-using OfficeOpenXml.Drawing;
 using OfficeOpenXml.Style;
+using OfficeOpenXml.Drawing;
+
+using DESCARGAR_CATALOGO.Models;
 
 namespace DESCARGAR_CATALOGO.Services
 {
@@ -17,14 +21,10 @@ namespace DESCARGAR_CATALOGO.Services
         private readonly IConfiguration _config;
         private readonly ILogger<ExcelGeneratorService> _logger;
 
+        // AppSettings
         private readonly string? _rutaBaseFotos;
         private readonly string? _rutaLogo;
         private readonly bool _desactivarImagenes;
-
-        // ====== Ajustes visuales ======
-        private const int COL_FOTO = 2;             // Columna B
-        private const double ANCHO_COL_FOTO = 18.0; // ancho columna B
-        private const double ALTO_FILA_PT = 110.0;  // alto de fila en puntos
 
         public ExcelGeneratorService(IConfiguration config, ILogger<ExcelGeneratorService> logger)
         {
@@ -40,29 +40,50 @@ namespace DESCARGAR_CATALOGO.Services
 
         public async Task<byte[]> GenerarExcelConFotosAsync(IEnumerable<ProductoDto> productos)
         {
+            _logger.LogInformation(
+                "GenerarExcelConFotosAsync -> RutaBaseFotos='{RutaBaseFotos}', RutaLogo='{RutaLogo}', DesactivarImagenes={Flag}",
+                _rutaBaseFotos, _rutaLogo, _desactivarImagenes
+            );
+
+            bool tieneRutaFotos = !_desactivarImagenes && !string.IsNullOrWhiteSpace(_rutaBaseFotos);
+            bool tieneRutaLogo = !_desactivarImagenes && !string.IsNullOrWhiteSpace(_rutaLogo);
+
             using var package = new ExcelPackage();
             var ws = package.Workbook.Worksheets.Add("Catálogo");
 
-            // ========= ENCABEZADO, LOGO Y TÍTULOS =========
-            if (!_desactivarImagenes && !string.IsNullOrWhiteSpace(_rutaLogo) && File.Exists(_rutaLogo!))
+            // ========== LOGO ==========
+            if (tieneRutaLogo && File.Exists(_rutaLogo!))
             {
                 try
                 {
-                    var logoBytes = await File.ReadAllBytesAsync(_rutaLogo!);
-                    var logo = ws.Drawings.AddPicture("LogoEmpresa", new MemoryStream(logoBytes));
-                    logo.SetPosition(0, 5, 0, 5);
-                    logo.SetSize(180, 60);
+                    using var fsLogo = File.OpenRead(_rutaLogo!);
+                    var picLogo = ws.Drawings.AddPicture("LogoEmpresa", fsLogo);
+                    // El logo no necesita anclaje TwoCell; lo ponemos arriba a la izquierda
+                    picLogo.SetPosition(0, 5, 0, 5); // fila 1, col A (ajústalo a gusto)
+                    picLogo.SetSize(180, 60);
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogWarning(ex, "No se pudo cargar el logo desde {RutaLogo}", _rutaLogo);
+                    _logger.LogError(ex, "No se pudo insertar el logo desde '{LogoPath}'", _rutaLogo);
                 }
             }
 
+            // ========== CABECERA Y TOTALES ==========
             ws.Cells["A1:C3"].Merge = true;
             ws.Row(1).Height = 25;
             ws.Row(2).Height = 25;
 
+            ws.Cells["L1"].Value = "Total neto";
+            ws.Cells["L2"].Value = "IVA";
+            ws.Cells["L3"].Value = "Total";
+            ws.Cells["L1:L3"].Style.Font.Bold = true;
+            ws.Cells["M1:M3"].Style.Border.BorderAround(ExcelBorderStyle.Thin);
+            ws.Cells["M1:M3"].Style.Numberformat.Format = "$ #,##0";
+            ws.Cells["M1"].Formula = "SUBTOTAL(9,K:K)";
+            ws.Cells["M2"].Formula = "M1*0.19";
+            ws.Cells["M3"].Formula = "M1+M2";
+
+            // ========== ENCABEZADOS ==========
             int headerRow = 4;
             ws.Cells[headerRow, 1].Value = "Código";
             ws.Cells[headerRow, 2].Value = "Foto";
@@ -81,188 +102,161 @@ namespace DESCARGAR_CATALOGO.Services
             {
                 hdr.Style.Font.Bold = true;
                 hdr.Style.Fill.PatternType = ExcelFillStyle.Solid;
-                hdr.Style.Fill.BackgroundColor.SetColor(System.Drawing.Color.LightGray);
+                hdr.Style.Fill.BackgroundColor.SetColor(Color.LightGray);
                 hdr.Style.Border.Bottom.Style = ExcelBorderStyle.Thin;
             }
             ws.Cells[headerRow, 1, headerRow, 12].AutoFilter = true;
 
-            // Anchos columna y formato moneda
-            ws.Column(COL_FOTO).Width = ANCHO_COL_FOTO;
-
-            ws.Column(1).Width = 12;
-            ws.Column(3).Width = 35;
-            ws.Column(4).Width = 20;
-            ws.Column(5).Width = 20;
-            ws.Column(6).Width = 8;
-            ws.Column(7).Width = 8;
-            ws.Column(8).Width = 12;
-            ws.Column(9).Width = 12;
-            ws.Column(10).Width = 10;
-            ws.Column(11).Width = 12;
-            ws.Column(12).Width = 12;
-
-            ws.Column(1).Style.Numberformat.Format = "0";
-            ws.Column(8).Style.Numberformat.Format = "$ #,##0";
-            ws.Column(9).Style.Numberformat.Format = "$ #,##0";
-            ws.Column(11).Style.Numberformat.Format = "$ #,##0";
-            ws.Column(12).Style.Numberformat.Format = "$ #,##0";
-
-            // ========= FILAS =========
-            int fila = headerRow + 1;
-
-            foreach (var p in productos ?? Enumerable.Empty<ProductoDto>())
+            // ========== Helper para encontrar la foto ==========
+            string? BuscarFotoPorCodigo(string? itemCode)
             {
-                // Alto de fila consistente para que la foto encaje
-                ws.Row(fila).Height = ALTO_FILA_PT;
+                if (!tieneRutaFotos || string.IsNullOrWhiteSpace(itemCode)) return null;
 
-                // Código
-                if (long.TryParse(p.ItemCode, out long skuNum))
-                    ws.Cells[fila, 1].Value = skuNum;
-                else
-                    ws.Cells[fila, 1].Value = p.ItemCode;
+                var soloDigitos = new string(itemCode.Where(char.IsDigit).ToArray());
 
-                // Descripción / datos
-                ws.Cells[fila, 3].Value = p.ItemName;
-                ws.Cells[fila, 4].Value = p.Marca;
-                ws.Cells[fila, 5].Value = p.UFamilia;
-                ws.Cells[fila, 6].Value = p.Caja;
-                ws.Cells[fila, 7].Value = p.M;
-                ws.Cells[fila, 8].Value = p.PrecioCliente;
-                ws.Cells[fila, 9].Formula = $"H{fila}*1.19";
-                ws.Cells[fila, 10].Style.Fill.PatternType = ExcelFillStyle.Solid;
-                ws.Cells[fila, 10].Style.Fill.BackgroundColor.SetColor(System.Drawing.Color.Orange);
-                ws.Cells[fila, 12].Formula = $"H{fila}*0.95";
-                ws.Cells[fila, 11].Formula = $"IF(AND(J{fila}>=F{fila},L{fila}>0),J{fila}*L{fila},J{fila}*H{fila})";
-
-                // FOTO
-                if (!_desactivarImagenes && !string.IsNullOrWhiteSpace(_rutaBaseFotos))
+                var candidatos = new List<string>();
+                if (!string.IsNullOrEmpty(soloDigitos))
                 {
-                    var rutaImg = BuscarFotoPorCodigo(_rutaBaseFotos!, p.ItemCode);
-                    if (rutaImg is not null)
+                    var seis = soloDigitos.PadLeft(6, '0'); // 3150 -> 003150
+                    candidatos.Add(Path.Combine(_rutaBaseFotos!, $"f{seis}.jpg"));
+                    candidatos.Add(Path.Combine(_rutaBaseFotos!, $"f{seis}.jpeg"));
+                    candidatos.Add(Path.Combine(_rutaBaseFotos!, $"F{seis}.jpg"));
+                    candidatos.Add(Path.Combine(_rutaBaseFotos!, $"F{seis}.jpeg"));
+                }
+
+                candidatos.Add(Path.Combine(_rutaBaseFotos!, $"f{itemCode}.jpg"));
+                candidatos.Add(Path.Combine(_rutaBaseFotos!, $"{itemCode}.jpg"));
+                candidatos.Add(Path.Combine(_rutaBaseFotos!, $"f{itemCode}.jpeg"));
+                candidatos.Add(Path.Combine(_rutaBaseFotos!, $"{itemCode}.jpeg"));
+
+                foreach (var ruta in candidatos)
+                    if (File.Exists(ruta)) return ruta;
+
+                return null;
+            }
+
+            // ========== FILAS ==========
+            int fila = headerRow + 1; // empieza en 5
+            foreach (var prod in productos ?? Enumerable.Empty<ProductoDto>())
+            {
+                // Altura de la fila pensada para la imagen
+                ws.Row(fila).Height = 100;
+
+                // Código (numérico si es posible)
+                if (long.TryParse(prod.ItemCode, out long skuNumber))
+                    ws.Cells[fila, 1].Value = skuNumber;
+                else
+                    ws.Cells[fila, 1].Value = prod.ItemCode;
+
+                // ==== IMAGEN (anclaje TwoCell manual con From/To + offsets EMU) ====
+                if (tieneRutaFotos)
+                {
+                    var rutaImg = !string.IsNullOrWhiteSpace(prod.ItemCode) ? BuscarFotoPorCodigo(prod.ItemCode) : null;
+
+                    if (!string.IsNullOrWhiteSpace(rutaImg))
                     {
                         try
                         {
-                            await InsertarImagenEnCeldaAsync(ws, rutaImg, fila, COL_FOTO, p.ItemCode);
+                            byte[] imgBytes = await File.ReadAllBytesAsync(rutaImg!);
+
+                            // Leer dimensiones
+                            int imgAncho, imgAlto;
+                            using (var ms = new MemoryStream(imgBytes))
+                            using (var img = System.Drawing.Image.FromStream(ms))
+                            {
+                                imgAncho = img.Width;
+                                imgAlto = img.Height;
+                            }
+
+                            // Agregar imagen
+                            var pic = ws.Drawings.AddPicture($"img_{prod.ItemCode}_{fila}", new MemoryStream(imgBytes));
+
+                            // Tamaño máximo
+                            int maxAncho = 125;
+                            int maxAlto = 120;
+
+                            // Calcular escala
+                            double escala = Math.Min((double)maxAncho / imgAncho, (double)maxAlto / imgAlto);
+                            escala = Math.Min(escala, 1.0);
+
+                            int anchoFinal = (int)(imgAncho * escala);
+                            int altoFinal = (int)(imgAlto * escala);
+
+                            // Posicionar y dimensionar
+                            int row0 = fila - 1;
+                            int colB = 1;
+
+                            pic.SetPosition(row0, 5, colB, 5);
+                            pic.SetSize(anchoFinal, altoFinal);
+
+                            // No llamar SetSize/SetPosition/EditAs: el área la define From/To
                         }
                         catch (Exception ex)
                         {
-                            _logger.LogWarning(ex, "Error insertando imagen {ItemCode} desde {Ruta}", p.ItemCode, rutaImg);
+                            _logger.LogError(ex, "Error insertando imagen para {ItemCode} desde {Ruta}", prod.ItemCode, rutaImg);
                         }
                     }
                     else
                     {
-                        _logger.LogDebug("Sin imagen para ItemCode={ItemCode}", p.ItemCode);
+                        if (!string.IsNullOrEmpty(prod.ItemCode))
+                            _logger.LogWarning("Imagen no encontrada para ItemCode='{ItemCode}' en base '{Base}'", prod.ItemCode, _rutaBaseFotos);
                     }
                 }
+
+                // Texto y números
+                ws.Cells[fila, 3].Value = prod.ItemName; // Descripción
+                ws.Cells[fila, 4].Value = prod.Marca;
+                ws.Cells[fila, 5].Value = prod.UFamilia;
+
+                ws.Cells[fila, 6].Value = prod.Caja;          // Caja
+                ws.Cells[fila, 7].Value = prod.M;             // Inner
+                ws.Cells[fila, 8].Value = prod.PrecioCliente; // Precio Neto
+
+                // Precio con IVA
+                ws.Cells[fila, 9].Formula = $"H{fila}*1.19";
+
+                // Cantidad editable
+                ws.Cells[fila, 10].Style.Fill.PatternType = ExcelFillStyle.Solid;
+                ws.Cells[fila, 10].Style.Fill.BackgroundColor.SetColor(Color.Orange);
+
+                // Total (si J>=F y L>0 => J*L ; si no J*H)
+                ws.Cells[fila, 11].Formula = $"IF(AND(J{fila}>=F{fila},L{fila}>0),J{fila}*L{fila},J{fila}*H{fila})";
+
+                // Precio caja 5% desc.
+                ws.Cells[fila, 12].Formula = $"H{fila}*0.95";
+
+                // formatos
+                ws.Cells[fila, 8].Style.Numberformat.Format = "$ #,##0";
+                ws.Cells[fila, 9].Style.Numberformat.Format = "$ #,##0";
+                ws.Cells[fila, 11].Style.Numberformat.Format = "$ #,##0";
+                ws.Cells[fila, 12].Style.Numberformat.Format = "$ #,##0";
 
                 fila++;
             }
 
+            // ========== ANCHOS Y FORMATOS ==========
+            ws.Column(1).Width = 12; // Código
+            ws.Column(2).Width = 20; // Foto (ajusta 14–16)
+            ws.Column(3).Width = 35; // Descripción
+            ws.Column(4).Width = 20; // Marca
+            ws.Column(5).Width = 20; // Familia
+            ws.Column(6).Width = 8;  // Caja
+            ws.Column(7).Width = 8;  // Inner
+            ws.Column(8).Width = 12; // Precio Neto
+            ws.Column(9).Width = 12; // Precio C/IVA
+            ws.Column(10).Width = 10; // Cantidad
+            ws.Column(11).Width = 12; // Total
+            ws.Column(12).Width = 12; // Precio Caja
+
+            // Código numérico sin decimales
+            ws.Column(1).Style.Numberformat.Format = "0";
+
+            // Fila de encabezado fija
             ws.View.FreezePanes(headerRow + 1, 1);
-            return await package.GetAsByteArrayAsync();
-        }
 
-        // ================== Helpers ==================
-
-        /// <summary>
-        /// Inserta imagen en celda con proporción correcta y anclada para filtros
-        /// </summary>
-        private async Task InsertarImagenEnCeldaAsync(ExcelWorksheet ws, string rutaImagen, int fila, int columna, string? itemCode)
-        {
-            // Leer imagen como FileStream para EPPlus
-            using var fileStream = new FileStream(rutaImagen, FileMode.Open, FileAccess.Read, FileShare.Read);
-
-            // Crear memoria stream para obtener dimensiones
-            var memoryStream = new MemoryStream();
-            await fileStream.CopyToAsync(memoryStream);
-            memoryStream.Position = 0;
-
-            // Obtener dimensiones de imagen usando EPPlus interno
-            int imgWidth = 0;
-            int imgHeight = 0;
-
-            try
-            {
-                using (var tempImage = System.Drawing.Image.FromStream(memoryStream, false, false))
-                {
-                    imgWidth = tempImage.Width;
-                    imgHeight = tempImage.Height;
-                }
-            }
-            catch
-            {
-                // Valores por defecto si falla la lectura
-                imgWidth = 200;
-                imgHeight = 200;
-            }
-
-            // Reiniciar stream para EPPlus
-            memoryStream.Position = 0;
-
-            // Crear nombre único para la imagen
-            var picName = $"img_{(itemCode ?? "SKU")}_{fila}";
-            var pic = ws.Drawings.AddPicture(picName, memoryStream);
-
-            // Calcular dimensiones de la celda en píxeles
-            double cellWidthChars = ws.Column(columna).Width;
-            double cellHeightPts = ws.Row(fila).Height;
-
-            int cellWidthPx = (int)Math.Round(cellWidthChars * 7.0);
-            int cellHeightPx = (int)Math.Round(cellHeightPts * 96.0 / 72.0);
-
-            // Calcular escala manteniendo proporción (con padding)
-            int padding = 8;
-            int maxWidth = cellWidthPx - (padding * 2);
-            int maxHeight = cellHeightPx - (padding * 2);
-
-            double scaleWidth = (double)maxWidth / imgWidth;
-            double scaleHeight = (double)maxHeight / imgHeight;
-            double scale = Math.Min(scaleWidth, scaleHeight);
-            scale = Math.Min(scale, 1.0); // No agrandar imagen
-
-            int finalWidth = (int)Math.Round(imgWidth * scale);
-            int finalHeight = (int)Math.Round(imgHeight * scale);
-
-            // CRÍTICO: Configurar anclaje ANTES de posición
-            pic.EditAs = eEditAs.OneCell; // Se mueve y oculta con la celda al filtrar
-
-            // Posicionar imagen (centrada en la celda)
-            int offsetX = (cellWidthPx - finalWidth) / 2;
-            int offsetY = (cellHeightPx - finalHeight) / 2;
-
-            pic.SetPosition(fila - 1, Math.Max(0, offsetY), columna - 1, Math.Max(0, offsetX));
-            pic.SetSize(finalWidth, finalHeight);
-        }
-
-        /// <summary>
-        /// Busca foto por SKU. Acepta formatos f{000000}.jpg/jpeg, F{000000}.jpg/jpeg o {ItemCode}.jpg/jpeg.
-        /// </summary>
-        private static string? BuscarFotoPorCodigo(string basePath, string? itemCode)
-        {
-            if (string.IsNullOrWhiteSpace(basePath) || string.IsNullOrWhiteSpace(itemCode))
-                return null;
-
-            var digits = new string(itemCode.Where(char.IsDigit).ToArray());
-            var list = new List<string>();
-
-            if (!string.IsNullOrEmpty(digits))
-            {
-                var seis = digits.PadLeft(6, '0');
-                list.Add(Path.Combine(basePath, $"f{seis}.jpg"));
-                list.Add(Path.Combine(basePath, $"f{seis}.jpeg"));
-                list.Add(Path.Combine(basePath, $"F{seis}.jpg"));
-                list.Add(Path.Combine(basePath, $"F{seis}.jpeg"));
-            }
-
-            list.Add(Path.Combine(basePath, $"f{itemCode}.jpg"));
-            list.Add(Path.Combine(basePath, $"f{itemCode}.jpeg"));
-            list.Add(Path.Combine(basePath, $"{itemCode}.jpg"));
-            list.Add(Path.Combine(basePath, $"{itemCode}.jpeg"));
-
-            foreach (var p in list)
-                if (File.Exists(p)) return p;
-
-            return null;
+            var bytes = await package.GetAsByteArrayAsync();
+            _logger.LogInformation("Excel generado: {Filas} filas de datos.", fila - (headerRow + 1));
+            return bytes;
         }
     }
 }
